@@ -2,35 +2,15 @@ import passport from "passport";
 import { Strategy as LocalStrategy } from "passport-local";
 import { Express } from "express";
 import session from "express-session";
-import { scrypt, randomBytes, timingSafeEqual } from "crypto";
-import { promisify } from "util";
-import { storage } from "./storage";
-import { User as SelectUser } from "@shared/schema";
+import { User as SelectUser, InsertUser } from "@shared/schema";
 import MemoryStore from "memorystore";
+import { userDataStore } from './file-data-store';
+import bcrypt from 'bcrypt';
 
 declare global {
   namespace Express {
     interface User extends SelectUser {}
   }
-}
-
-const scryptAsync = promisify(scrypt);
-
-async function hashPassword(password: string) {
-  const salt = randomBytes(16).toString("hex");
-  const buf = (await scryptAsync(password, salt, 64)) as Buffer;
-  return `${buf.toString("hex")}.${salt}`;
-}
-
-async function comparePasswords(supplied: string, stored: string) {
-  if (!stored || !stored.includes('.')) {
-    // 如果密码为空或格式不正确，返回false
-    return false;
-  }
-  const [hashed, salt] = stored.split(".");
-  const hashedBuf = Buffer.from(hashed, "hex");
-  const suppliedBuf = (await scryptAsync(supplied, salt, 64)) as Buffer;
-  return timingSafeEqual(hashedBuf, suppliedBuf);
 }
 
 export function setupAuth(app: Express) {
@@ -59,8 +39,8 @@ export function setupAuth(app: Express) {
   passport.use(
     new LocalStrategy(async (username, password, done) => {
       try {
-        const user = await storage.getUserByUsername(username);
-        if (!user || !(await comparePasswords(password, user.password))) {
+        const user = userDataStore.findUserByUsernameOrEmail(username);
+        if (!user || !(await bcrypt.compare(password, user.password))) {
           return done(null, false, { message: '用户名或密码错误' });
         } else {
           return done(null, user);
@@ -74,7 +54,7 @@ export function setupAuth(app: Express) {
   passport.serializeUser((user, done) => done(null, user.id));
   passport.deserializeUser(async (id: number, done) => {
     try {
-      const user = await storage.getUser(id);
+      const user = userDataStore.findUserById(id);
       done(null, user || undefined);
     } catch (err) {
       done(err);
@@ -82,54 +62,61 @@ export function setupAuth(app: Express) {
   });
 
   app.post("/api/auth/register", async (req, res, next) => {
-    console.log(">>> Received /api/auth/register request");
+    console.log("[Register Route] >>> Received /api/auth/register request");
     try {
-      const { username, password, email, displayName } = req.body;
-      console.log(">>> Request body:", { username, email, displayName });
+      const { username, password, email, displayName, profileImage, adhd_profile, identityTags, isConsultant, consultantTitle, consultantBio, consultantVerified, points } = req.body;
+      console.log("[Register Route] >>> Request body:", { username, email, displayName });
 
       if (!username || !password || !email || !displayName) {
-        console.log(">>> Missing required fields");
-        return res.status(400).json({ message: "所有字段都是必填的" });
+        console.log("[Register Route] >>> Missing required fields");
+        return res.status(400).json({ message: "用户名, 密码, 邮箱, 显示名称是必填的" });
       }
       
-      console.log(`>>> Checking if username exists: ${username}`);
-      const existingUser = await storage.getUserByUsername(username);
-      console.log(">>> Existing user check result:", existingUser);
-      if (existingUser) {
-        console.log(">>> Username already exists");
-        return res.status(409).json({ message: "用户名已被占用" });
-      }
-      
-      console.log(">>> Creating new user...");
-      const user = await storage.createUser({
+      const userDataForStore: Omit<InsertUser, 'password'> & { passwordPlainText: string } = {
         username,
-        password: await hashPassword(password),
+        passwordPlainText: password,
         email,
         displayName,
-        profileImage: null,
-        adhd_profile: null,
-        identityTags: [],
-        isConsultant: false,
-        consultantTitle: null,
-        consultantBio: null,
-        consultantVerified: false,
-        points: 0
-      });
-      console.log(">>> User created:", user);
+        profileImage: profileImage ?? null,
+        adhd_profile: adhd_profile ?? null,
+        identityTags: identityTags ?? null,
+        isConsultant: isConsultant ?? false,
+        consultantTitle: consultantTitle ?? null,
+        consultantBio: consultantBio ?? null,
+        consultantVerified: consultantVerified ?? false,
+        points: points ?? 0
+      };
+      console.log("[Register Route] >>> Prepared user data for saving:", userDataForStore);
+
+      console.log("[Register Route] >>> Calling userDataStore.addUser...");
+      // *** 确保调用的是 userDataStore.addUser ***
+      const user = await userDataStore.addUser(userDataForStore); 
+      console.log("[Register Route] >>> User created via userDataStore (before req.login):", user);
 
       req.login(user, (err) => {
         if (err) {
-          console.error(">>> req.login error:", err);
+          console.error("[Register Route] >>> req.login error:", err);
           return next(err);
         }
-        // Don't send password back to client
         const { password: _, ...userWithoutPassword } = user;
-        console.log(">>> Sending success response after req.login");
+        console.log("[Register Route] >>> Sending success response after req.login");
         res.status(201).json(userWithoutPassword);
       });
-    } catch (err) {
-      console.error(">>> Registration Error Caught:", err);
-      res.status(500).json({ message: "注册过程中出错" });
+    } catch (err: any) {
+      console.error("[Register Route] >>> Registration Error Caught:", err);
+      console.error("[Register Route] >>> Error Stack:", err.stack);
+      
+      if (err.message === 'Username or email already exists.') {
+        console.log("[Register Route] >>> Responding with 409 - Conflict");
+        return res.status(409).json({ message: "用户名或邮箱已被占用" });
+      } 
+      else if (err.message?.startsWith('Failed to write users file:')) {
+         console.log("[Register Route] >>> Responding with 500 - File Write Error");
+         return res.status(500).json({ message: "服务器无法保存用户信息，请稍后重试或联系管理员" });
+      }
+      
+      console.log("[Register Route] >>> Responding with 500 - Generic Server Error");
+      res.status(500).json({ message: err.message || "注册过程中发生未知错误" });
     }
   });
 
